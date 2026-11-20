@@ -70,6 +70,9 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         block_table_for(owner.layer_name),
         num_query_heads=owner.num_heads,
         selection_width=indexer.output_width,
+        # ПАТЧ (17.11.2026): владелец знает свой KV-dtype (в т.ч. наш nvfp4),
+        # а по геометрии страницы его пришлось бы угадывать.
+        kv_cache_dtype=owner.kv_cache_dtype,
     )
     logger.info(
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
