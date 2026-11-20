@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import os
+
 import torch
 
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
@@ -69,12 +71,188 @@ def _is_sm90() -> bool:
     """True on sm_90 (H100/H200/H20): selects the sm_90 tuning table."""
     return current_platform.get_device_capability() == (9, 0)
 
+@triton.jit
+def _nvfp4_decode_e2m1(nibble):
+    """Decode one FP4 E2M1 nibble (sign + 3 magnitude bits) to float32.
+
+    For magnitude >= 2 the value is 2^(exp - 1) * (1 + m / 2), i.e. the
+    float32 bit pattern (126 << 23) + (magnitude << 22); magnitudes 0 and 1
+    are the subnormals 0.0 and 0.5.
+    """
+    magnitude = nibble & 0x07
+    magnitude_i32 = magnitude.to(tl.int32)
+    sign_bits = ((nibble & 0x08).to(tl.uint32)) << 28
+    normal_bits = ((126 << 23) + (magnitude_i32 << 22)).to(tl.uint32) | sign_bits
+    normal = normal_bits.to(tl.uint32).to(tl.float32, bitcast=True)
+    subnormal_bits = ((magnitude & 0x01).to(tl.uint32) * 0x3F000000) | sign_bits
+    subnormal = subnormal_bits.to(tl.uint32).to(tl.float32, bitcast=True)
+    return tl.where(magnitude < 2, subnormal, normal)
+
+
+@triton.jit
+def _nvfp4_scale_to_float(bits):
+    """Decode an E4M3 block scale (magnitude only) to float32.
+
+    Block scales come from absolute maxima, so the sign bit is masked. Bias
+    7 -> 127 is +120 on the exponent; subnormals are mant * 2^-9.
+    """
+    payload = bits.to(tl.int32) & 0x7F
+    exp_bits = (payload >> 3) & 0x0F
+    mant = payload & 0x07
+    normal_bits = ((exp_bits + 120) << 23) | (mant << 20)
+    normal = normal_bits.to(tl.uint32).to(tl.float32, bitcast=True)
+    subnormal = mant.to(tl.float32) / 512.0
+    value = tl.where(exp_bits == 0, subnormal, normal)
+    return tl.where(payload == 0, 0.0, value)
+
+
+@triton.jit
+def _nvfp4_scale_coord(slot, group, SWIZZLED: tl.constexpr, SCALE_DIM: tl.constexpr):
+    """Storage coordinates (row, scale index) of the block scale for a
+    (row in page, 16-value group) pair.
+
+    LINEAR is the identity. SWIZZLED is the permutation within groups of four
+    rows that reshape_and_cache_flash writes for the V side:
+        (t, s) -> ((t // 4) * 4 + s // G, (s % G) * 4 + t % 4),  G = SCALE_DIM // 4
+    """
+    SWIZZLE_GROUP: tl.constexpr = SCALE_DIM // 4
+    # No swizzle group exists for SCALE_DIM < 4 (tiny HEAD_DIM < 64 fixtures):
+    # the permutation degenerates to the identity and the %0 constant would
+    # crash the MLIR pass manager. Production (HEAD_DIM=128 -> G=2) unchanged.
+    if SWIZZLED and SWIZZLE_GROUP >= 1:
+        return (slot // 4) * 4 + (group // SWIZZLE_GROUP), (
+            group % SWIZZLE_GROUP
+        ) * 4 + (slot % 4)
+    return slot + group * 0, group + slot * 0
+
+
+@triton.jit(do_not_specialize=["num_requests", "max_pages"])
+def _nvfp4_dequant_pages_kernel(
+    data_ptr,
+    scale_ptr,
+    scale_global_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    stride_data_block,
+    stride_data_token,
+    stride_data_head,
+    stride_scale_block,
+    stride_scale_token,
+    stride_scale_head,
+    stride_out_block,
+    stride_out_token,
+    stride_out_head,
+    stride_table_req,
+    num_requests,
+    max_pages,
+    num_chunks,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
+    DIM_BLOCK: tl.constexpr,
+    SWIZZLED: tl.constexpr,
+) -> None:
+    """H1 dequant-avanse: decode one side's E2M1 pages into a BF16 scratch
+    paged cache. One CTA per (request, page, head, token-chunk); the page
+    bound is the request's live KV length, so idle CTAs exit after one load.
+    The output value is fully dequantized (E2M1 x fp8 block scale x layer
+    global scale), exactly what the in-kernel read path would produce, so the
+    attention kernel can run its plain BF16 branch (num_stages=2) over the
+    scratch without any scale plumbing.
+
+    The page axis is split into TOKEN_BLOCK chunks (grid dim 3) because a
+    single page (e.g. 1392 tokens) is far too large for one CTA's register
+    file; each CTA handles TOKEN_BLOCK tokens x the full head dim. TOKEN_BLOCK
+    is a power of 2 (host-computed, capped) so tl.arange is valid; the page
+    mask (token < PAGE_SIZE) trims the final partial chunk and any page-size
+    that is not a power of 2. DIM_BLOCK pads HEAD_DIM to a power of 2 for the
+    same reason. The main QSA kernel never aranges over the page axis, so it
+    is unaffected by non-power-of-2 page sizes.
+    """
+    # 3-D grid (triton limit): head x chunk folded into axis 2.
+    req = tl.program_id(0)
+    page = tl.program_id(1)
+    h = tl.program_id(2)
+    head = h // num_chunks
+    chunk = h % num_chunks
+    pmax = (tl.load(seq_lens_ptr + req) + PAGE_SIZE - 1) // PAGE_SIZE
+    if page >= pmax:
+        return
+    phys = tl.load(block_table_ptr + req * stride_table_req + page)
+    if phys < 0:
+        return
+    safe_phys = phys.to(tl.int64)
+
+    tok0 = chunk * TOKEN_BLOCK
+    token = tok0 + tl.arange(0, TOKEN_BLOCK)
+    dim = tl.arange(0, DIM_BLOCK)
+    tok_mask = token < PAGE_SIZE
+    dim_mask = dim < HEAD_DIM
+    mask = tok_mask[:, None] & dim_mask[None, :]
+    byte_offsets = dim // 2
+    # Two fp4 values per byte: even dims carry the low nibble, odd the high.
+    raw = tl.load(
+        data_ptr
+        + safe_phys * stride_data_block
+        + token[:, None] * stride_data_token
+        + head * stride_data_head
+        + byte_offsets[None, :],
+        mask=mask,
+        other=0,
+    )
+    nibble = tl.where((dim[None, :] & 1) != 0, (raw >> 4) & 0x0F, raw & 0x0F)
+    # One fp8 block scale covers 16 dims. K scales are stored linearly
+    # (token, group); V scales are written by reshape_and_cache_flash in the
+    # TRT-LLM swizzle, the same permutation the in-kernel read path applies
+    # via _nvfp4_scale_coord: within a group of four rows, (t, s) ->
+    # ((t // 4) * 4 + s // G, (s % G) * 4 + t % 4), G = (HEAD_DIM // 16) // 4.
+    SCALE_DIM: tl.constexpr = HEAD_DIM // 16
+    SWIZZLE_GROUP: tl.constexpr = SCALE_DIM // 4
+    if SWIZZLED and SWIZZLE_GROUP >= 1:
+        scale_row = (token[:, None] // 4) * 4 + (dim[None, :] // 16) // SWIZZLE_GROUP
+        scale_col = ((dim[None, :] // 16) % SWIZZLE_GROUP) * 4 + (token[:, None] % 4)
+    else:
+        scale_row = token[:, None]
+        scale_col = dim[None, :] // 16
+    # Masked lanes (token/dim out of the live page) are predicated off, so
+    # their out-of-bounds addresses are never touched; in the swizzled case
+    # the storage row can trail the token row by up to G-1, so bound it too.
+    scale_mask = mask & (scale_row < PAGE_SIZE)
+    sf_bits = tl.load(
+        scale_ptr
+        + safe_phys * stride_scale_block
+        + scale_row * stride_scale_token
+        + head * stride_scale_head
+        + scale_col,
+        mask=scale_mask,
+        other=0,
+    )
+    scale_val = _nvfp4_scale_to_float(sf_bits) * tl.load(scale_global_ptr)
+    value = _nvfp4_decode_e2m1(nibble) * scale_val
+    tl.store(
+        out_ptr
+        + safe_phys * stride_out_block
+        + token[:, None] * stride_out_token
+        + head * stride_out_head
+        + dim[None, :],
+        value.to(tl.bfloat16),
+        mask=mask,
+    )
+
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    # Per-layer fp32 scales (1-element device buffers). Only read on the
+    # quantized branches; any valid pointer is passed for bf16.
+    k_scale_ptr,
+    v_scale_ptr,
+    # nvfp4 block-scale pages (raw uint8 bits), only read on the nvfp4 branch.
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -92,6 +270,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    # Strides of the nvfp4 block-scale pages (from nvfp4_split_data_scale);
+    # data and scale regions have different row widths.
+    stride_ks_block,
+    stride_ks_token,
+    stride_ks_head,
+    stride_vs_block,
+    stride_vs_token,
+    stride_vs_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -111,6 +297,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # Compile-time branch selection. With both False the dequantization code
+    # is compiled out and the bf16 path is unchanged.
+    KV_QUANT_FP8: tl.constexpr = False,
+    KV_QUANT_NVFP4: tl.constexpr = False,
+    V_SCALE_SWIZZLED: tl.constexpr = True,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -173,31 +364,118 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
-        # measured slower here and less accurate).
-        keys = _maybe_dequant(keys).to(query.dtype)
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
-        # softmax) so fp16 has the range, its wider mantissa is more
-        # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
-        values = _maybe_dequant(values)
+        if KV_QUANT_NVFP4:
+     # A cache row holds HEAD_DIM values in HEAD_DIM // 2 bytes (two
+            # E2M1 nibbles per byte, even index in the low nibble) plus
+            # HEAD_DIM // 16 E4M3 block scales in a separate page region.
+            # value = nibble * block_scale * layer_scale. Orientation as in the
+            # bf16 branch: keys [HEAD_DIM, BLOCK_N], values [BLOCK_N, HEAD_DIM].
+            byte_offsets = dim_offsets // 2
+            k_bytes = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + byte_offsets[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            k_nib = tl.where(
+                (dim_offsets[:, None] & 1) == 0, k_bytes & 0x0F, (k_bytes >> 4) & 0x0F
+            )
+            v_bytes = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + byte_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            v_nib = tl.where(
+                (dim_offsets[None, :] & 1) == 0, v_bytes & 0x0F, (v_bytes >> 4) & 0x0F
+            )
+            # Block scales are loaded at their natural width
+            # [HEAD_DIM // 16, BLOCK_N] and broadcast to the data tile in
+            # registers: dim_offsets is tl.arange(0, HEAD_DIM), so group =
+            # dim // 16 covers 16 consecutive rows, which broadcast_to +
+            # reshape restores. Decoding and the layer-scale multiply run on
+            # HEAD_DIM // 16 rows instead of HEAD_DIM. K scales are stored
+            # linearly, V scales follow V_SCALE_SWIZZLED. HEAD_DIM // 16 is
+            # passed as an expression; a constexpr binding inside a constexpr
+            # branch is not reliable in Triton.
+            sf_groups = tl.arange(0, HEAD_DIM // 16)
+            ks_slot, ks_group = _nvfp4_scale_coord(
+                page_offset[None, :], sf_groups[:, None], False, HEAD_DIM // 16
+            )
+            k_sf = _nvfp4_scale_to_float(
+                tl.load(
+                    k_scale_cache_ptr
+                    + safe_page[None, :] * stride_ks_block
+                    + ks_slot * stride_ks_token
+                    + kv_head * stride_ks_head
+                    + ks_group,
+                    mask=valid[None, :],
+                    other=0,
+                )
+            ) * tl.load(k_scale_ptr)
+            keys = (
+                _nvfp4_decode_e2m1(k_nib)
+                * tl.reshape(
+                    tl.broadcast_to(k_sf[:, None, :], (HEAD_DIM // 16, 16, BLOCK_N)),
+                    (HEAD_DIM, BLOCK_N),
+                )
+            ).to(query.dtype)
+            vs_slot, vs_group = _nvfp4_scale_coord(
+                page_offset[:, None],
+                sf_groups[None, :],
+                V_SCALE_SWIZZLED,
+                HEAD_DIM // 16,
+            )
+            v_sf = _nvfp4_scale_to_float(
+                tl.load(
+                    v_scale_cache_ptr
+                    + safe_page[:, None] * stride_vs_block
+                    + vs_slot * stride_vs_token
+                    + kv_head * stride_vs_head
+                    + vs_group,
+                    mask=valid[:, None],
+                    other=0,
+                )
+            ) * tl.load(v_scale_ptr)
+            values = (
+                _nvfp4_decode_e2m1(v_nib)
+                * tl.reshape(
+                    tl.broadcast_to(v_sf[:, :, None], (BLOCK_N, HEAD_DIM // 16, 16)),
+                    (BLOCK_N, HEAD_DIM),
+                )
+            ).to(query.dtype)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
+            # measured slower here and less accurate).
+            keys = _maybe_dequant(keys).to(query.dtype)
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+            # softmax) so fp16 has the range, its wider mantissa is more
+            # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+            values = _maybe_dequant(values)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
         # caches the K dequant scale is already folded into softmax_scale on the
@@ -645,10 +923,19 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
+    v_scale_swizzled: bool = True,
     *,
     output_gate: torch.Tensor,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
+    """Run sparse GQA directly over paged BF16, FP8-E4M3 or NVFP4 K/V caches.
+
+    ``k_scale`` / ``v_scale`` are the per-layer scales (host floats for fp8,
+    1-element device tensors for nvfp4), required for quantized caches. For
+    nvfp4, ``k_cache`` / ``v_cache`` are the packed data pages (uint8, last
+    dim ``head_dim // 2``) and ``k_scale_cache`` / ``v_scale_cache`` the
+    block-scale pages (uint8, last dim ``head_dim // 16``).
 
     An fp8 cache is a native e4m3 view on sm_89+ and the raw uint8 storage
     below sm_89 (no Triton fp8e4nv pointer type there); the kernel dequantizes
@@ -675,29 +962,60 @@ def qsa_sparse_paged_attention(
         raise ValueError(
             "QSA packed indices need selection columns plus the count column"
         )
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    use_nvfp4 = k_scale_cache is not None
+    row_width = q.shape[2] // 2 if use_nvfp4 else q.shape[2]
+    if row_width != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    is_fp8 = k_cache.dtype != torch.bfloat16
-    if is_fp8:
-        assert k_scale is not None and v_scale is not None
-        # Host pre-multiply: fold the K dequant scale into the attention scale
-        # and pass V's dequant scale as the kernel's output scale.
-        softmax_scale = (head_dim**-0.5) * float(k_scale)
-        output_scale = float(v_scale)
-        if k_cache.dtype == torch.uint8:
-            # _maybe_dequant's byte decode yields x * 2^-8; fold 2^8 into the
-            # scales so the decode needs no multiply.
-            softmax_scale *= 256.0
-            output_scale *= 256.0
-        else:
-            assert k_cache.dtype == torch.float8_e4m3fn
-    else:
+    assert k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+    use_fp8 = (not use_nvfp4) and k_cache.dtype != torch.bfloat16
+    if use_nvfp4:
+
+        if k_cache.dtype != torch.uint8:
+            raise ValueError("QSA nvfp4 KV cache must be stored as uint8")
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("QSA nvfp4 KV cache requires both scale pages")
+        if k_scale_cache.dtype != torch.uint8 or v_scale_cache.dtype != torch.uint8:
+            raise ValueError("QSA nvfp4 block scales must be raw uint8 bits")
+        if k_scale_cache.shape[3] != head_dim // 16:
+            raise ValueError("QSA nvfp4 block-scale page has the wrong width")
+        if k_scale_cache.shape[:3] != k_cache.shape[:3]:
+            raise ValueError("QSA nvfp4 data and scale pages disagree in shape")
+        if k_scale_cache.stride(3) != 1 or v_scale_cache.stride(3) != 1:
+            raise ValueError("QSA nvfp4 block scales must be contiguous per row")
+        if k_scale is None or v_scale is None:
+            raise ValueError("QSA quantized KV cache requires k_scale and v_scale")
+        if k_scale.numel() != 1 or v_scale.numel() != 1:
+            raise ValueError("QSA quantized KV cache expects scalar per-layer scales")
+        if k_scale.device != q.device or v_scale.device != q.device:
+            raise ValueError("QSA KV scales must live on the query device")
+        # In-kernel E2M1 path: the per-layer scales are 1-element device
+        # buffers the kernel loads and folds into the dequant, so the
+        # host-side attention/output scales stay neutral.
         softmax_scale = head_dim**-0.5
         output_scale = 1.0
+    else:
+        is_fp8 = k_cache.dtype != torch.bfloat16
+        if is_fp8:
+            assert k_scale is not None and v_scale is not None
+            # Host pre-multiply: fold the K dequant scale into the attention scale
+            # and pass V's dequant scale as the kernel's output scale.
+            softmax_scale = (head_dim**-0.5) * float(k_scale)
+            output_scale = float(v_scale)
+            if k_cache.dtype == torch.uint8:
+                # _maybe_dequant's byte decode yields x * 2^-8; fold 2^8 into the
+                # scales so the decode needs no multiply.
+                softmax_scale *= 256.0
+                output_scale *= 256.0
+            else:
+                assert k_cache.dtype == torch.float8_e4m3fn
+        else:
+            softmax_scale = head_dim**-0.5
+            output_scale = 1.0
+
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -722,10 +1040,21 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width,
+        is_fp8=use_fp8,
     )
+    num_stages = 2
+    if use_nvfp4 and block_n > 32:
+        # NVFP4 (PR #54846, sm_120 tuning): the wide prefill tile halved to 32
+        # measured 1.7x faster than 64; one pipeline stage. The narrow decode
+        # profile (BLOCK_N=16) keeps two stages.
+        block_n = 32
+        num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+        num_splits = min(num_splits, num_tiles)
+        num_stages = 1
 
     # Split=1 writes output directly and compiles out all workspace accesses.
+    quantized = use_nvfp4 or use_fp8
     if num_splits == 1:
         partial_output = out
         partial_lse = out
@@ -742,10 +1071,36 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    # Triton needs an argument even for compiled-out branches; any valid
+    # tensor is passed on the bf16 path.
+    k_scale_arg = k_scale if quantized else q
+    v_scale_arg = v_scale if quantized else q
+    k_sf_arg = q
+    v_sf_arg = q
+    ks_strides = (0, 0, 0)
+    vs_strides = (0, 0, 0)
+    if use_nvfp4:
+        assert k_scale_cache is not None and v_scale_cache is not None
+        k_sf_arg = k_scale_cache
+        v_sf_arg = v_scale_cache
+        ks_strides = (
+            k_scale_cache.stride(0),
+            k_scale_cache.stride(1),
+            k_scale_cache.stride(2),
+        )
+        vs_strides = (
+            v_scale_cache.stride(0),
+            v_scale_cache.stride(1),
+            v_scale_cache.stride(2),
+        )
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
         v_cache,
+        k_scale_arg,
+        v_scale_arg,
+        k_sf_arg,
+        v_sf_arg,
         logical_indices,
         block_table,
         token_to_req,
@@ -763,6 +1118,12 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        ks_strides[0],
+        ks_strides[1],
+        ks_strides[2],
+        vs_strides[0],
+        vs_strides[1],
+        vs_strides[2],
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -782,8 +1143,11 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_QUANT_FP8=use_fp8,
+        KV_QUANT_NVFP4=use_nvfp4,
+        V_SCALE_SWIZZLED=bool(v_scale_swizzled),
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
     if num_splits == 1:
         return out
@@ -808,37 +1172,216 @@ def qsa_sparse_paged_attention(
     return out
 
 
+def qsa_nvfp4_dequant_pages(
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    out_k: torch.Tensor,
+    out_v: torch.Tensor,
+    *,
+    max_seq_len: int,
+    v_scale_swizzled: bool = True,
+) -> None:
+    """Decode the live NVFP4 K/V pages into BF16 scratch paged caches.
+
+    The caller (qsa.py forward_qsa) does this once per layer before running
+    ``qsa_sparse_paged_attention`` over ``out_k``/``out_v`` with the plain
+    BF16 branch, replacing the in-kernel E2M1 unpack that pins the attention
+    kernel to num_stages=1 on sm_120. out_k/out_v must mirror the packed
+    data views with a full-width last axis: [B, PAGE_SIZE, H, HEAD_DIM].
+    The scratch reuses the real block_table geometry, so no extra page
+    bookkeeping is needed.
+    """
+    if not all(
+        (t.stride(3) == 1 for t in (k_data, v_data, k_scale_cache, v_scale_cache, out_k, out_v))
+    ):
+        raise ValueError("qsa_nvfp4_dequant_pages needs last-contiguous views")
+    num_requests = block_table.shape[0]
+    num_heads = k_data.shape[2]
+    head_dim = out_k.shape[3]
+    page_size = k_data.shape[1]
+    max_pages = triton.cdiv(max_seq_len, page_size)
+    if num_requests == 0 or max_pages == 0:
+        return
+    # tl.arange requires power-of-2 ranges and a page (e.g. 1392 tokens) is
+    # too large for one CTA, so split the page axis into capped power-of-2
+    # token chunks (grid dim 3) and pad the head dim to a power of 2; masks
+    # trim the partial last chunk / non-power-of-2 dims.
+    token_block = min(triton.next_power_of_2(page_size), 64)
+    dim_block = triton.next_power_of_2(head_dim)
+    num_chunks = triton.cdiv(page_size, token_block)
+    if os.environ.get("QSA_H1_DEBUG"):
+
+        def _pow2(x):
+            return x >= 1 and (x & (x - 1)) == 0
+
+        print(
+            f"[H1-DEBUG] k_data.shape={tuple(k_data.shape)} out_k.shape={tuple(out_k.shape)} "
+            f"page_size={page_size} head_dim={head_dim} num_heads={num_heads} "
+            f"token_block={token_block} dim_block={dim_block} num_chunks={num_chunks} "
+            f"pow2(page)={_pow2(page_size)} pow2(head)={_pow2(head_dim)}",
+            flush=True,
+        )
+    # 3-D grid (triton limit): head x chunk folded into axis 2.
+    grid = (num_requests, max_pages, num_heads * num_chunks)
+    _nvfp4_dequant_pages_kernel[grid](
+        k_data,
+        k_scale_cache,
+        k_scale,
+        block_table,
+        seq_lens,
+        out_k,
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_scale_cache.stride(0),
+        k_scale_cache.stride(1),
+        k_scale_cache.stride(2),
+        out_k.stride(0),
+        out_k.stride(1),
+        out_k.stride(2),
+        block_table.stride(0),
+        num_requests,
+        max_pages,
+        num_chunks,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        TOKEN_BLOCK=token_block,
+        DIM_BLOCK=dim_block,
+        SWIZZLED=False,
+        num_warps=8,
+        num_stages=2,
+    )
+    _nvfp4_dequant_pages_kernel[grid](
+        v_data,
+        v_scale_cache,
+        v_scale,
+        block_table,
+        seq_lens,
+        out_v,
+        v_data.stride(0),
+        v_data.stride(1),
+        v_data.stride(2),
+        v_scale_cache.stride(0),
+        v_scale_cache.stride(1),
+        v_scale_cache.stride(2),
+        out_v.stride(0),
+        out_v.stride(1),
+        out_v.stride(2),
+        block_table.stride(0),
+        num_requests,
+        max_pages,
+        num_chunks,
+        PAGE_SIZE=v_data.shape[1],
+        HEAD_DIM=head_dim,
+        TOKEN_BLOCK=token_block,
+        DIM_BLOCK=dim_block,
+        SWIZZLED=v_scale_swizzled,
+        num_warps=8,
+        num_stages=2,
+    )
+
+
+def _looks_packed_nvfp4(kv_cache: torch.Tensor) -> bool:
+    """Infer a packed nvfp4 cache from its page width.
+
+    A packed nvfp4 page is ``head_size // 2 + head_size // 16`` bytes (9/16 of
+    head_size), so ``16 * width // 9`` is a power-of-two head size while
+    ``width // 2`` is not. A bf16/fp8 page is ``2 * head_size`` wide, which
+    never satisfies the 9-divisibility test for a power-of-two head size.
+    """
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] % 9:
+        return False
+    head_size = kv_cache.shape[-1] * 16 // 9
+    half = kv_cache.shape[-1] // 2
+    return (
+        head_size >= 16
+        and (head_size & (head_size - 1)) == 0
+        and (half < 16 or (half & (half - 1)) != 0)
+    )
+
+
 def warmup_qsa_sparse_paged_attention(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     *,
     num_query_heads: int,
     selection_width: int,
+    kv_cache_dtype: str | None = None,
+    v_scale_swizzled: bool = True,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Compile every production-reachable split-K/merge specialization."""
-    head_dim = kv_cache.shape[-1] // 2
-    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
-    # An fp8 cache is allocated as uint8 storage; warm the dtype the impl hands
-    # over: an e4m3 view on sm_89+, the raw bytes below.
-    is_fp8 = kv_cache.dtype == torch.uint8
-    fp8_dtype = (
-        torch.float8_e4m3fn
-        if current_platform.has_device_capability(89)
-        else torch.uint8
-    )
-    cache_dtype = fp8_dtype if is_fp8 else key_cache.dtype
+    """Compile every production-reachable split-K/merge specialization.
+
+    ``kv_cache_dtype`` picks the layout: ``nvfp4`` caches are packed (K and V
+    in separate head slots of ``head_size // 2 + head_size // 16`` bytes plus
+    block-scale pages), everything else is ``[B, 2 * H, N, head_size]``. It is
+    inferred from the page width when omitted.
+    """
+    if kv_cache_dtype is None:
+        kv_cache_dtype = "nvfp4" if _looks_packed_nvfp4(kv_cache) else "auto"
+    use_nvfp4 = str(kv_cache_dtype).startswith("nvfp4")
+    if use_nvfp4 and os.environ.get("QSA_CAKE") == "1":
+        # The Cake branch of Qwen4ExpQSAImpl.forward returns before this
+        # kernel on every call, so no config here is reachable: warming would
+        # only compile dead variants.
+        return ()
+    k_scale_cache: torch.Tensor | None = None
+    v_scale_cache: torch.Tensor | None = None
+    if use_nvfp4:
+        # Same split the reader side uses, so the warmed strides are the ones
+        # production passes.
+        from vllm.utils.torch_utils import nvfp4_split_data_scale
+
+        num_kv_heads = kv_cache.shape[1] // 2
+        k_data, k_scales = nvfp4_split_data_scale(
+            kv_cache[:, :num_kv_heads].transpose(1, 2)
+        )
+        v_data, v_scales = nvfp4_split_data_scale(
+            kv_cache[:, num_kv_heads:].transpose(1, 2)
+        )
+        key_cache, value_cache = k_data, v_data
+        k_scale_cache = k_scales.view(torch.uint8)
+        v_scale_cache = v_scales.view(torch.uint8)
+        head_dim = 2 * k_data.shape[3]
+        cache_dtype = torch.uint8
+        is_fp8 = False
+    else:
+        head_dim = kv_cache.shape[-1] // 2
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+        # An fp8 cache is allocated as uint8 storage; warm the dtype the impl
+        # hands over: an e4m3 view on sm_89+, the raw bytes below.
+        is_fp8 = kv_cache.dtype == torch.uint8
+        fp8_dtype = (
+            torch.float8_e4m3fn
+            if current_platform.has_device_capability(89)
+            else torch.uint8
+        )
+        cache_dtype = fp8_dtype if is_fp8 else key_cache.dtype
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
 
-    # Every config the dispatch can pick for this group size.
-    profiles = {
-        _select_config(
-            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
-        )
-        for num_rows in range(1, 8193)
-        for use_prefill_config in (False, True)
-    }
+    # Every config the dispatch can pick for this group size, after the nvfp4
+    # override qsa_sparse_paged_attention applies (narrower tile, one stage).
+    profiles = set()
+    for num_rows in range(1, 8193):
+        for use_prefill_config in (False, True):
+            block_n, warps, num_tiles, num_splits = _select_config(
+                num_rows, num_kv_heads, use_prefill_config, selection_width,
+                is_fp8=is_fp8,
+            )
+            num_stages = 2
+            if use_nvfp4 and block_n > 32:
+                block_n = 32
+                num_tiles = triton.cdiv(selection_width + 1, block_n)
+                num_splits = min(num_splits, num_tiles)
+                num_stages = 1
+            profiles.add((block_n, warps, num_tiles, num_splits, num_stages))
 
     # Scalars constant per deployment get their real values (their divisibility
     # specialization is wanted); the batch-varying ones are do_not_specialize'd
@@ -877,8 +1420,31 @@ def warmup_qsa_sparse_paged_attention(
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
+    # Triton needs an argument even for compiled-out branches; any valid tensor
+    # serves the bf16 path, exactly as qsa_sparse_paged_attention does.
+    quantized = use_nvfp4 or is_fp8
+    k_scale_ptr = TritonWarmupTensor(torch.float32) if quantized else q_ptr
+    v_scale_ptr = TritonWarmupTensor(torch.float32) if quantized else q_ptr
+    if use_nvfp4:
+        assert k_scale_cache is not None and v_scale_cache is not None
+        k_sf_ptr = TritonWarmupTensor(
+            torch.uint8,
+            shape=tuple(k_scale_cache.shape),
+            strides=tuple(k_scale_cache.stride()),
+        )
+        v_sf_ptr = TritonWarmupTensor(
+            torch.uint8,
+            shape=tuple(v_scale_cache.shape),
+            strides=tuple(v_scale_cache.stride()),
+        )
+        ks_strides = tuple(k_scale_cache.stride(d) for d in range(3))
+        vs_strides = tuple(v_scale_cache.stride(d) for d in range(3))
+    else:
+        k_sf_ptr = v_sf_ptr = q_ptr
+        ks_strides = vs_strides = (0, 0, 0)
+
     warmed = []
-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
+    for block_n, warps, num_tiles, num_splits, num_stages in sorted(profiles):
         if num_splits == 1:
             partial_output_ptr = output_ptr
             partial_lse_ptr = output_ptr
@@ -894,6 +1460,10 @@ def warmup_qsa_sparse_paged_attention(
             q_ptr,
             k_cache_ptr,
             v_cache_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
+            k_sf_ptr,
+            v_sf_ptr,
             indices_ptr,
             block_table_ptr,
             token_to_req_ptr,
@@ -911,6 +1481,12 @@ def warmup_qsa_sparse_paged_attention(
             value_cache.stride(0),
             value_cache.stride(1),
             value_cache.stride(2),
+            ks_strides[0],
+            ks_strides[1],
+            ks_strides[2],
+            vs_strides[0],
+            vs_strides[1],
+            vs_strides[2],
             selection_width + 1,
             block_table.stride(0),
             row_stride,
@@ -930,8 +1506,11 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            KV_QUANT_FP8=is_fp8,
+            KV_QUANT_NVFP4=use_nvfp4,
+            V_SCALE_SWIZZLED=bool(v_scale_swizzled),
             num_warps=warps,
-            num_stages=2,
+            num_stages=num_stages,
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:
