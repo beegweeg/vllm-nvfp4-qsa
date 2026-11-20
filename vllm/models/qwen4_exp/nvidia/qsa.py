@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -39,7 +42,11 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
+    get_dtype_size,
     kv_cache_dtype_str_to_dtype,
+    nvfp4_kv_cache_full_dim,
+    nvfp4_split_data_scale,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -48,9 +55,11 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
+    is_quantized_kv_cache,
 )
 
 from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
@@ -125,6 +134,74 @@ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
 
         return super().load_weights(remap_shards())
 
+# KV cache dtypes accepted for the QSA main cache. fp8_e5m2 is left out on
+# purpose (smaller mantissa, no benefit for K/V); nvfp4_4over6 changes the
+# block-scale search in the writer and has not been evaluated on this path.
+# The indexer caches are not affected: they are constructed in bf16 (the
+# key-state cache packs int64 mRoPE positions into bf16 cells).
+_QSA_KV_CACHE_DTYPES: tuple[str, ...] = ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
+
+# Storage dtypes of the main cache. Quantized caches are allocated as uint8
+# (STR_DTYPE_TO_TORCH_DTYPE); the bytes are reinterpreted right before the
+# kernel.
+_QSA_KV_STORAGE_DTYPES = (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
+
+# Block-scale layout written by reshape_and_cache_flash for nvfp4: K block
+# scales are stored linearly, V block scales are swizzled for the TRT-LLM
+# decode kernels. The read kernel follows the same convention.
+_NVFP4_V_SCALE_SWIZZLED = True
+# A/B switch: QSA_CAKE=1 routes the NVFP4 main attention through FlashInfer's
+# Cake kernels (`flashinfer.sparse.qsa_sparse_paged_attention`, sm_120a) and
+# switches the cache writer to FlashInfer's
+# `nvfp4_quantize_append_paged_kv_cache_with_slot_mapping`. Cake reads *linear*
+# V block scales, while `reshape_and_cache_flash` writes the TRT-LLM swizzle,
+# so the two must move together — writer and reader are switched as a pair.
+_QSA_CAKE = os.environ.get("QSA_CAKE") == "1"
+# A/B switch: QSA_H1_DISABLE=1 skips the H1 dequant-avanse prefill path and
+# runs the in-kernel NVFP4 read instead (smoke-test reference).
+_QSA_H1_DISABLE = os.environ.get("QSA_H1_DISABLE") == "1"
+
+
+def _nvfp4_attention_spec(spec: AttentionSpec) -> AttentionSpec:
+    """Apply the nvfp4 page geometry to a QSA main-cache spec.
+
+    K and V get separate head slots (all K heads first, then all V heads, the
+    order ``kv_cache.split(num_kv_heads, dim=1)`` expects) and a cell shrinks
+    from ``head_size + head_size_v`` bf16 values to
+    ``head_size // 2 + head_size // 16`` bytes of fp4 data plus fp8 block
+    scales. Same geometry as ``FlashInferBackend.customize_spec``. Idempotent,
+    so it does not matter whether the model runner calls ``customize_spec``
+    in addition to the owner applying it.
+    """
+    if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
+        return spec
+    hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
+    hs_v = nvfp4_kv_cache_full_dim(spec.head_size_v)
+    assert hs_k == hs_v, "nvfp4 with asymmetric K/V head sizes not yet supported"
+    return replace(
+        spec,
+        num_head_slots=2 * spec.num_kv_heads,
+        state_content_bytes=hs_k * get_dtype_size(spec.dtype),
+    )
+
+
+def _nvfp4_cache_views(
+    kv_cache: torch.Tensor, num_kv_heads: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a packed nvfp4 cache ``[B, 2 * H, N, 144]`` into strided views.
+
+    Returns ``(k_data, k_scales, v_data, v_scales)``, each ``[B, N, H, X]``
+    with X = ``head_size // 2`` data bytes or ``head_size // 16`` block scales.
+    The byte arithmetic is ``nvfp4_split_data_scale``, the same helper the
+    writer side uses, so both sides see one layout by construction. Scales are
+    returned as raw uint8 bits; the kernel decodes them.
+    """
+    k_side = kv_cache[:, :num_kv_heads].transpose(1, 2)
+    v_side = kv_cache[:, num_kv_heads:].transpose(1, 2)
+    k_data, k_scales = nvfp4_split_data_scale(k_side)
+    v_data, v_scales = nvfp4_split_data_scale(v_side)
+    return k_data, k_scales.view(torch.uint8), v_data, v_scales.view(torch.uint8)
+
 
 class Qwen4ExpQSABackend(AttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
@@ -138,6 +215,7 @@ class Qwen4ExpQSABackend(AttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "nvfp4",
     ]
 
     # The owner writes K/V before calling the sparse attention implementation.
@@ -184,15 +262,68 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+        if kv_cache_dtype not in _QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                "Qwen4Exp QSA requires a BF16, FP8-E4M3 or NVFP4 main KV cache"
             )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        # nvfp4 is a separate branch (page geometry, writer, read kernel), not
+        # fp8 with a different dtype.
+        self.kv_cache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
+        self.kv_cache_fp8 = (
+            is_quantized_kv_cache(kv_cache_dtype) and not self.kv_cache_nvfp4
+        )
+        # Strided views on the packed nvfp4 cache, built once per cache buffer.
+        # as_strided is metadata only, but it would otherwise run in every
+        # decode step, and the pointers stay stable across CUDA graph capture.
+        self._nvfp4_views: tuple[int, tuple[torch.Tensor, ...]] | None = None
+        # H1 dequant-avance scratch: one shared BF16 K/V paged-cache pair,
+        # keyed on pool geometry (all layers share the pool, so one pair is
+        # reused: each layer's dequant overwrites it right before that
+        # layer's attention kernel runs).
+        self._nvfp4_scratch: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _nvfp4_views_for(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        key = kv_cache.data_ptr()
+        cached = self._nvfp4_views
+        if cached is None or cached[0] != key:
+            cached = (key, _nvfp4_cache_views(kv_cache, self.num_kv_heads))
+            self._nvfp4_views = cached
+        return cached[1]
+
+    def _nvfp4_scratch_for(
+        self, k_data: torch.Tensor, v_data: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared BF16 scratch paged caches for the dequant-avance prefill
+        path: same [B, PAGE_SIZE, H, ...] geometry as the packed views with a
+        full-width last axis. Keyed on pool geometry (num_pages, page_size,
+        heads, head_dim, device), not the layer tensor: every layer shares
+        the one pool, so a single pair is overwritten per layer in stream
+        order — no cross-layer overlap.
+        """
+        key = (
+            k_data.shape[0],
+            k_data.shape[1],
+            k_data.shape[2],
+            2 * k_data.shape[3],
+            v_data.shape[3] * 2,
+            k_data.device.index,
+        )
+        scratch = self._nvfp4_scratch.get(key)
+        if scratch is None:
+            shape_k = (*k_data.shape[:3], 2 * k_data.shape[3])
+            shape_v = (*v_data.shape[:3], 2 * v_data.shape[3])
+            scratch = (
+                torch.empty(shape_k, dtype=torch.bfloat16, device=k_data.device),
+                torch.empty(shape_v, dtype=torch.bfloat16, device=v_data.device),
+            )
+            self._nvfp4_scratch.clear()
+            self._nvfp4_scratch[key] = scratch
+        return scratch
 
     def do_kv_cache_update(
         self,
@@ -203,12 +334,51 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         """Scatter K/V using the same layout and scales as the fused writer."""
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        if not self.kv_cache_nvfp4:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+            ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+            return
+        # nvfp4 stores K and V in separate head slots of
+        # head_size // 2 + head_size // 16 bytes, so the cache is cut by head
+        # slot here: (B, 2n, N, 144) -> two views (B, N, n, 144), the 4D shape
+        # reshape_and_cache_flash expects for nvfp4.
+        n = self.num_kv_heads
+        if _QSA_CAKE:
+            # Cake reads linear V block scales; reshape_and_cache_flash writes
+            # the TRT-LLM swizzle. FlashInfer's writer stores both sides
+            # linearly, which is exactly the format Cake was validated against.
+            from flashinfer import (
+                nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as append,
+            )
+
+            k_view, k_sf, v_view, v_sf = self._nvfp4_views_for(kv_cache)
+            append(
+                key,
+                value,
+                slot_mapping,
+                (k_view, v_view),
+                (k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn)),
+                layer._k_scale,
+                layer._v_scale,
+                kv_layout="NHD",
+            )
+            return
         ops.reshape_and_cache_flash(
             key,
             value,
-            key_cache,
-            value_cache,
+            kv_cache[:, :n].transpose(1, 2),
+            kv_cache[:, n:].transpose(1, 2),
             slot_mapping,
             self.kv_cache_dtype,
             layer._k_scale,
@@ -238,27 +408,108 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         k_scale = v_scale = None
-        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            # The cache is allocated as uint8; on sm_89+ reinterpret the e4m3
-            # bytes (same itemsize, so shape and strides are preserved). Below
-            # sm_89 the kernel byte-decodes the raw uint8 storage instead.
-            if current_platform.has_device_capability(89):
-                key_cache = key_cache.view(torch.float8_e4m3fn)
-                value_cache = value_cache.view(torch.float8_e4m3fn)
-            # Host-side per-tensor dequant scales (Python floats), as used by
-            # other host-scale backends; folded into the kernel's scales.
-            k_scale = layer._k_scale_float
-            v_scale = layer._v_scale_float
+        k_scale_cache: torch.Tensor | None = None
+        v_scale_cache: torch.Tensor | None = None
+        if self.kv_cache_nvfp4:
+            # Packed rows carry data and block scales for K and V in separate
+            # head slots; there is nothing to split at head_size.
+            key_cache, k_scale_cache, value_cache, v_scale_cache = (
+                self._nvfp4_views_for(kv_cache)
+            )
+            # Per-layer dequant scales as 1-element device buffers
+            # (set_default_quant_scales, register_buffer=True): the kernel's
+            # quantized branches read them device-side, so CUDA graph
+            # capture stays copy-free.
+            k_scale = getattr(layer, "_k_scale", None)
+            v_scale = getattr(layer, "_v_scale", None)
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+            key_cache = canonicalize_singleton_dim_strides(key_cache)
+            value_cache = canonicalize_singleton_dim_strides(value_cache)
+            if self.kv_cache_fp8:
+                # The cache is allocated as uint8; on sm_89+ reinterpret the
+                # e4m3 bytes (same itemsize, so shape and strides preserved).
+                # Below sm_89 the kernel byte-decodes the raw uint8 storage.
+                if current_platform.has_device_capability(89):
+                    key_cache = key_cache.view(torch.float8_e4m3fn)
+                    value_cache = value_cache.view(torch.float8_e4m3fn)
+                # Host-side per-tensor dequant scales (Python floats), folded
+                # into the kernel's scales.
+                k_scale = layer._k_scale_float
+                v_scale = layer._v_scale_float
         if query.dtype != torch.bfloat16 or key_cache.dtype not in (
             torch.bfloat16,
             torch.float8_e4m3fn,
             torch.uint8,
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 Q and BF16 or FP8-e4m3 K/V"
+                "Qwen4Exp QSA requires BF16 Q and BF16, FP8-e4m3 or NVFP4 K/V"
             )
+
+        if _QSA_CAKE and self.kv_cache_nvfp4:
+            # Cake path: FlashInfer's native sm_120a NVFP4 sparse attention reads
+            # the packed cache directly (0.41-0.60x the FP8 Triton time in the
+            # isolated bench), so neither the BF16 scratch of H1 nor the
+            # in-kernel Triton E2M1 unpack is needed. `_nvfp4_views_for` returns
+            # uint8 scale views; Cake wants them as float8_e4m3fn.
+            from flashinfer.sparse import qsa_sparse_paged_attention as cake_qsa
+
+            # The unfused gate projection hands back a flat [tokens, H * D]
+            # tensor (and the qsa_prepare path a 3D one); Cake validates the
+            # shape against q, so fold it the same way the Triton path does.
+            gate_view = (
+                output_gate[:num_tokens]
+                .reshape(query[:num_tokens].shape)
+                .contiguous()
+            )
+            cake_qsa(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                use_prefill_config,
+                output[:num_tokens],
+                float(layer._k_scale_float),
+                float(layer._v_scale_float),
+                output_gate=gate_view,
+                k_sf=k_scale_cache.view(torch.float8_e4m3fn),
+                v_sf=v_scale_cache.view(torch.float8_e4m3fn),
+                backend="cake",
+            )
+            return output
+
+        if self.kv_cache_nvfp4 and use_prefill_config and not _QSA_H1_DISABLE:
+            # H1 dequant-avanse: the in-kernel E2M1 unpack is the read-side
+            # bottleneck (pins num_stages=1 and kills split-kv on sm_120).
+            # Decode the live pages ahead into shared BF16 scratch and run
+            # the fast BF16 branch (num_stages=2, tuned sm_120 config).
+            # Decode/MTP-verify keeps the in-kernel path: tiny sparse tiles,
+            # no scratch traffic, zero regression surface.
+            from .ops.qsa import qsa_nvfp4_dequant_pages
+
+            scratch_k, scratch_v = self._nvfp4_scratch_for(key_cache, value_cache)
+            qsa_nvfp4_dequant_pages(
+                key_cache,
+                value_cache,
+                k_scale_cache,
+                v_scale_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                k_scale,
+                v_scale,
+                scratch_k,
+                scratch_v,
+                max_seq_len=attn_metadata.max_seq_len,
+                v_scale_swizzled=_NVFP4_V_SCALE_SWIZZLED,
+            )
+            key_cache, value_cache = scratch_k, scratch_v
+            k_scale_cache = v_scale_cache = None
+            k_scale = v_scale = None
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -273,6 +524,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             output[:num_tokens],
             k_scale=k_scale,
             v_scale=v_scale,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+            v_scale_swizzled=_NVFP4_V_SCALE_SWIZZLED,
             output_gate=output_gate[:num_tokens],
         )
         return output
@@ -301,14 +555,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in (
-            "auto",
-            "bfloat16",
-            "fp8",
-            "fp8_e4m3",
-        ):
+        if cache_config.cache_dtype not in _QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                "Qwen4Exp QSA requires a BF16, FP8-E4M3 or NVFP4 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -411,7 +660,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 or FP8-e4m3 (uint8) cache storage"
+                "Qwen4Exp QSA requires BF16, FP8-e4m3 (uint8) or NVFP4 (uint8) cache storage"
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
@@ -437,14 +686,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
         # them take the separate kernels. The fused writer receives an fp8
         # pointer, which Triton cannot lower below sm_89.
-        self.use_fused_qsa_prepare = (
-            self.use_fused_qk_norm_rope_gate
-            and self.indexer.use_fused_pre_indexer
-            and (
-                self.kv_cache_torch_dtype != torch.uint8
-                or current_platform.has_device_capability(89)
-            )
-        )
+        # H1 overlay (flashnext smoke 10-31, backup qsa.py.bak-fused): the
+        # fused qsa_prepare derives the main head geometry from the packed
+        # NVFP4 cache cell (main_head_dim = shape[-1] // 2,
+        # num_main_kv_heads = shape[2]), which only round-trips for the fp8
+        # K|V-stacked layout. With NVFP4 head_dim 256 (cell 144) the qkv
+        # width is not a multiple of 2 * cell, so its shape assert fires on
+        # the first prefill (qsa_prepare.py:572) and the whole PP pipeline
+        # deadlocks. The fused kernel itself targets the fp8 cache layout,
+        # so a host-side derive fix could still mis-index the NVFP4 cell
+        # silently. Force the separate-kernel reference path: its
+        # do_kv_cache_update is NVFP4-aware and layout-correct, and both
+        # smoke cases (a/b) share it, so the a/b comparison stays valid.
+        self.use_fused_qsa_prepare = False
         # Without a quant config here (BF16, or ModelOpt FP4, which keeps
         # attention in BF16) the fused layer is unquantized. Otherwise the
         # indexer shares the q/k/v GEMM only if it uses the same quant method.
@@ -490,13 +744,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return FullAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            head_size_v=self.head_dim,
-            dtype=self.kv_cache_torch_dtype,
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        # The owner builds its own spec, so the nvfp4 geometry is applied here
+        # as well as in customize_spec; both are idempotent.
+        return _nvfp4_attention_spec(
+            FullAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                head_size_v=self.head_dim,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            )
         )
 
     @eager_break_during_capture
