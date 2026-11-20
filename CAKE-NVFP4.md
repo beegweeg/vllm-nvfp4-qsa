@@ -36,7 +36,8 @@ NVFP4 KV-кеш для **Qwen4Exp QSA**. В апстриме его нет:
 
 ## Изменения против апстрима
 
-Ветка `cake-nvfp4-0.34.0` = тег `v0.34.0` + 6 коммитов, 6 файлов:
+Ветка `cake-nvfp4-0.34.0` = тег `v0.34.0` + 8 коммитов, из них 6 кодовых правок
+(6 файлов, `+1042/−120`) и 2 документационных. Кодовые правки:
 
 | файл | что даёт |
 |---|---|
@@ -47,7 +48,7 @@ NVFP4 KV-кеш для **Qwen4Exp QSA**. В апстриме его нет:
 | `v1/worker/gpu/spec_decode/speculator_config.py` | перенос `enable_cumem_allocator` в конфиг MTP-драфта |
 | `model_executor/warmup/qwen4_exp_qsa_warmup.py` | `kv_cache_dtype` в прогрев QSA-ядер |
 
-Ветка `cake-nvfp4-0.33` — те же 5 смысловых правок, но лежат в других файлах
+Ветка `cake-nvfp4-0.33` — те же 6 смысловых правок, но лежат в других файлах
 (`config/speculative.py` вместо `speculator_config.py`) плюс guard прогрева
 по `QSA_CAKE=1` вместо передачи `kv_cache_dtype`.
 
@@ -79,7 +80,7 @@ grep -n 'supported_kv_cache_dtypes' -A3 $SP/models/qwen4_exp/nvidia/qsa.py | hea
 ## Запуск
 
 Готовый набор флагов — [`launch.example.sh`](launch.example.sh) в корне ветки: пути и имя
-чекоинта вынесены в переменные окружения (`MODEL`, `SERVED`, `PORT`, `VENV`,
+checkpoint'а вынесены в переменные окружения (`MODEL`, `SERVED`, `PORT`, `VENV`,
 `KV_BYTES`). Боевой launcher лежит не в репозитории, а на сервере фермы
 (`~/flashnext-cake/start-8600.sh`), он же кнопка на дашборде — сверяться надо с
 ним. Без части флагов 0.34.0 не стартует:
@@ -92,6 +93,17 @@ grep -n 'supported_kv_cache_dtypes' -A3 $SP/models/qwen4_exp/nvidia/qsa.py | hea
 - `--enable-cumem-allocator` — без него MTP + оффлоад не сходятся (см. коммит
   `[Bugfix][Spec Decode]`)
 - MRV2-ключи capture-размеров в `--compilation-config`
+- `--engram-config '{"cpu_offload": true}'` — таблицы PLE в RAM
+- `QSA_CAKE=1` в окружении — A/B-переключатель cake-пути в NVFP4-attention, на
+  `=1` снят весь ряд замеров
+
+Поднимать надо модулем, а не субкомандой: в 0.34.0 `vllm serve` отвергает
+`--no-enable-extensible-kv-cache` («unrecognized arguments»), а без него явный
+размер KV-пула не держится. `python -m vllm.entrypoints.openai.api_server`
+принимает весь набор — на нём стоит прод. Полный набор переменных окружения
+(`QSA_CAKE`, `VLLM_KV_CACHE_LAYOUT`, `VLLM_USE_BREAKABLE_CUDAGRAPH`,
+`VLLM_USE_FLASHINFER_SAMPLER`, `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`,
+`PYTORCH_CUDA_ALLOC_CONF`) — в `launch.example.sh`.
 
 Старт идёт на PCIe Gen3 и сам переключается на Gen4 по готовности `/health`
 (`pcie-staging.sh`, `PCIE_STAGING=1`). Оставлять сервис на Gen3 после старта
