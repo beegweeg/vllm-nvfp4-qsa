@@ -205,6 +205,15 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
             spec_target_max_model_len=target.max_model_len,
             quantization=spec.quantization,
             enforce_eager=target.enforce_eager,
+            # ПАТЧ (17.11.2026): без переноса cumem-аллокатора MTP-драфт
+            # получает дефолт False, и _make_draft_vllm_config
+            # (models/qwen4_exp/nvidia/mtp.py) падает на валидаторе
+            # VllmConfig (config/vllm.py:1252): OffloadingConnector +
+            # expandable_segments требует enable_cumem_allocator. Драфт живёт
+            # в том же процессе и той же аллокаторной политике, что и таргет.
+            # (В 0.33 патч был в config/speculative.py — там draft ModelConfig
+            # строился на месте; в 0.34.0 его строит этот файл.)
+            enable_cumem_allocator=target.enable_cumem_allocator,
             max_logprobs=target.max_logprobs,
             hf_overrides=draft_hf_overrides,
             config_format=target.config_format,
