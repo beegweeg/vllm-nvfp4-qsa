@@ -1,111 +1,95 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vLLM + NVFP4 KV cache для Qwen4Exp QSA
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+English: NVFP4 KV cache for **Qwen4Exp QSA** on 8×RTX 5060
+Ti (SM120). Upstream vLLM does not accept `--kv-cache-dtype nvfp4` for this
+model; this branch adds it. Same decode speed as FP8 KV, **1.54× more context**
+in the same GPU budget.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+Форк `vllm-project/vllm`. Дефолдная ветка `cake-nvfp4-0.34.0` — рабочая, она же
+крутится на проде. Полный разбор ветки, сборки и запуска —
+[CAKE-NVFP4.md](CAKE-NVFP4.md); происхождение каждой цифры —
+[CAKE-NVFP4-BENCHMARKS.md](CAKE-NVFP4-BENCHMARKS.md).
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## С каким квантом тестировалось
 
----
+| | |
+|---|---|
+| модель | `Qwen4Exp QSA` (Qwen4Exp QSA), 48 слоёв: 36 `linear_attention` + 12 `full_attention` |
+| веса | **NVFP4**, ModelOpt `MIXED_PRECISION`: 48 экспертных блока `NVFP4` (W4A4) + 2 блока MTP `W4A16_NVFP4`, `group_size 16`; 101.68 GiB / 21 шард |
+| KV | сравнивались **`nvfp4`** и **`fp8_e4m3`** при одном и том же бюджете `--kv-cache-memory-bytes 2791728742` (2.60 GiB), чтобы сравнение не покупалось объёмом |
+| железо | 8×RTX 5060 Ti 16 GiB (SM120), PCIe Gen4 ×8, без NVLink и без P2P |
+| параллельность | TP=8 + `--enable-expert-parallel`, MTP3, `FULL_DECODE_ONLY`, `--moe-backend marlin` |
+| тир | `--kv-offloading-size 48` GiB (host), PLE `{"cpu_offload": true}` |
 
-## About
+Метрика везде: **`running_max / TPOT`** по счётчикам сервера, не `gen_tokens / wall`
+и не по меткам клиента. Промпты — случайные token ID, поэтому MTP-accept занижен
+(0.42–0.58) и все `t/s` ниже реального текста: это нижняя граница.
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+## Ёмкость KV при равных 2.60 GiB
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+| KV | токенов | на сессию 205k |
+|---|---|---|
+| **NVFP4** | **530,606** | ×2.5 |
+| FP8 (`fp8_e4m3`) | 343,671 | ×1.6 |
+| BF16 (`auto`) | ~265,000 | ×1.3 |
 
-vLLM is fast with:
+**NVFP4 даёт ×1.54 контекста против FP8** при равном бюджете. Снятие vision
+(856 MiB) разрыв не закрывает: даже отдать их пулу, FP8 дал бы ~423k.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+## Декод
 
-vLLM is flexible and easy to use with:
+| сценарий | KV | TPOT | на сессию | в сумме |
+|---|---|---|---|---|
+| 1 × 195k | NVFP4 | 6.5 мс | 153 | 153 |
+| **2 × 165k** | **NVFP4** | **9.42–9.53 мс** | 105 | **210** |
+| 4 × 128k | NVFP4 | 12.78 мс | 78 | 235 (на 3 оживших, 4-й в очереди) |
+| 8 × 8k | NVFP4 | 18.7 мс | 54 | 429 |
+| 2 × 165k | FP8 | 7.24–8.46 мс | 119 | 238 |
+| 3 × 90k | FP8 | 9.48–12.68 мс | 106 | 265 |
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, Iluvatar CoreX GPU, and more.
+**Скорость от dtype KV не zależy.** Разница FP8 к NVFP4 в 10–13% лежит в разбросе
+MTP-accept: тот же самый сценарий 2×165k давал от 9.42 до 14.24 мс на
+разных прогонах. Поэтому прода держится на NVFP4 — ради ёмкости, а не скорости.
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+## Префилл
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+| сценарий | результат |
+|---|---|
+| одиночный | ~2800 t/s, плоский по 8k–120k |
+| 4 холодных одновременно | 2795–2852 t/s **в сумме** — то есть последовательно, параллельного префилла нет (`max_num_scheduled_tokens = 2048` из-за MTP3) |
+| 2 декодят + 2 префиллят | TPOT декодящих 9.6 → **187.9 мс**, 5.3 t/s на сессию |
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+## Хост-тир против пребывания на GPU
 
-## Getting Started
+Подъём KV из CPU-тира стоит ровно столько же, сколько пребывание на GPU:
+**1.00×** (5.25 мс против 5.24 мс, 190.5 против 190.8 t/s). На этом держится
+режим «несколько генерирующих + остальные в RAM».
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+## Чего эти цифры НЕ доказывают
 
-```bash
-uv pip install vllm
-vllm download-kernels  # precompiled kernels for faster startup
-```
+- Ряды 4 × 32k/64k/96k/112k/120k встречаются в рабочих логах, но артефактов под
+  них не осталось — как измеренные не публикуются.
+- Все замеры сняты на `--moe-backend marlin`, который weight-only, тогда как 48
+  основных экспертных блока чекпоинта помечены W4A4; замена на нативное FP4-ядро
+  не тестировалась.
+- `--language-model-only` на NVFP4 не проверялся никогда: цифры ёмкости для него —
+  экстраполяция, единственный реальный прогон (на FP8) упал на 3.20 GiB.
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+## Ветка
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+На GitHub опубликована ровно одна ветка — **`cake-nvfp4-0.34.0`** (база — тег
+`v0.34.0`): боевой запуск :8600, он же прод. Откат `cake-nvfp4-0.33`
+(`fa3b9d1377`), не-NVFP4 эксперименты `lab/experiments-0.33` (Flint, Qwen3.5) и
+зеркало апстрима `main` живут в рабочем Gitea и локально — здесь их нет
+намеренно, чтобы форк оставалась одна продакшн-ветка.
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+Изменений против тега `v0.34.0`: 9 коммитов, 8 файлов, из них 6 кодовых. Два из
+них (`[Bugfix][Platforms]`, `[Bugfix][Spec Decode]`) самодостаточны и предлагаются
+в апстрим отдельно от остального.
 
-## Contributing
+## Лицензии
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+Код — Apache 2.0, как у vLLM. Чекпоинт `Qwen4Exp QSA` лицензирован Qwen Community License — коммерческое
+использование моделей регулируется ей, а не этой лицензией.
+Qwen Community License — коммерческое использование моделей регулируется ей, а не
+этой лицензией.
