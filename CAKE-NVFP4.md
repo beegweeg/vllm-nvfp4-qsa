@@ -12,10 +12,12 @@ FP8) — в [CAKE-NVFP4-BENCHMARKS.md](CAKE-NVFP4-BENCHMARKS.md). Железо �
 NVFP4 KV-кеш для **Qwen4Exp QSA**. В апстриме его нет:
 `Qwen4ExpQSABackend.supported_kv_cache_dtypes` не содержит `nvfp4`, а
 `Qwen4ExpQSAImpl.__init__` бросает `NotImplementedError`. Без этой ветки
-`--kv-cache-dtype nvfp4` для Flash-Next не запускается.
+`--kv-cache-dtype nvfp4` для этой геометрии не запускается.
 
-Назначение — держать KV в 4-бит при NVFP4-весах, чтобы в 16 GiB влезало
-~428k токенов на карту и 8 сессий по 205k токенов.
+Назначение — держать KV в 4-бит при NVFP4-весах. Замерено: в пул 2.60 GiB на
+8×RTX 5060 Ti влезает **530,606 токенов** против 343,671 у FP8 при том же
+бюджете. Это два режима: либо 2 генерирующих сессии по 205k на GPU, либо больше
+сессий, где генерирует только часть, а остальные лежат в хост-тире.
 
 ## Ветки
 
@@ -23,7 +25,7 @@ NVFP4 KV-кеш для **Qwen4Exp QSA**. В апстриме его нет:
 |---|---|---|
 | `cake-nvfp4-0.34.0` | тег `v0.34.0` (`62d4bc3c7e`) | **прод**, `~/venv/vllm-cake-0340` |
 | `cake-nvfp4-0.33` | `fa3b9d1377` (29.10.2026) | откат, `~/venv/vllm-cake-033` |
-| `lab/experiments-0.33` | `cake-nvfp4-0.33` | не-NVFP4 эксперименты, см. below |
+| `lab/experiments-0.33` | `cake-nvfp4-0.33` | Flint и Qwen3.5, см. соответствующий раздел |
 | `main` | апстрим `main` | зеркало, для diff/rebase |
 
 На GitHub из этого опубликована только `cake-nvfp4-0.34.0` — форк держится одна
@@ -76,13 +78,16 @@ grep -n 'supported_kv_cache_dtypes' -A3 $SP/models/qwen4_exp/nvidia/qsa.py | hea
 
 ## Запуск
 
-Полный launcher — `start-8600.sh` на сервере фермы (`~/flashnext-cake/`),
-он же кнопка на дашборде. Без части флагов 0.34.0 не стартует:
+Готовый набор флагов — [`launch.example.sh`](launch.example.sh) в корне ветки: пути и имя
+чекоинта вынесены в переменные окружения (`MODEL`, `SERVED`, `PORT`, `VENV`,
+`KV_BYTES`). Боевой launcher лежит не в репозитории, а на сервере фермы
+(`~/flashnext-cake/start-8600.sh`), он же кнопка на дашборде — сверяться надо с
+ним. Без части флагов 0.34.0 не стартует:
 
 - `--no-enable-extensible-kv-cache`
 - `--max-num-seqs 8` — иначе 37 draft-графов и OOM на захвате
-- `--kv-cache-memory-bytes 2254857830` — явный размер пула, автосайзинг
-  съедает память до прогрева ядер
+- `--kv-cache-memory-bytes 2791728742` — явный размер пула (2.60 GiB =
+  530,606 токенов), автосайзинг съедает память до прогрева ядер
 - `--kv-offloading-size 48 --kv-offloading-backend native`
 - `--enable-cumem-allocator` — без него MTP + оффлоад не сходятся (см. коммит
   `[Bugfix][Spec Decode]`)
